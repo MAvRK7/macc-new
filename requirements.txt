@@ -11,8 +11,8 @@ crewai==0.60.0
 crewai_tools==0.8.3
 
 # LLM clients
-openai==1.30.0  # Pin version for more deterministic installs
-mistralai==1.2.0  # Pin version for more deterministic installs
+openai==1.30.0
+mistralai==1.2.0
 
 # GitHub API
 PyGithub==2.4.0
@@ -21,7 +21,7 @@ PyGithub==2.4.0
 requests==2.32.3
 
 # Pydantic for models / validation
-pydantic==2.7.4
+pydantic==2.9.0  # Updated to match the required range
 
 # CLI helpers
 click==8.1.7
