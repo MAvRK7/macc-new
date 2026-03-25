@@ -1,10 +1,8 @@
-# Stage 1: Build dependencies
-FROM python:3.12-slim AS build
+FROM python:3.12-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system build dependencies
+# Install build dependencies + git for PyGithub
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -12,27 +10,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only the requirements file first to leverage Docker cache
+# Copy requirements
 COPY requirements.txt .
 
-# Upgrade pip and install the Python dependencies
+# Install Python dependencies using the --no-cache-dir flag for faster installs
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Stage 2: Final image
-FROM python:3.12-slim AS final
-
-# Set working directory for the app
-WORKDIR /app
-
-# Copy installed Python packages from the build stage
-COPY --from=build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-
-# Copy the rest of the backend code
+# Copy backend code
 COPY main.py .
 
-# Expose the port that Render will use
+# Expose default port (Render sets PORT)
 EXPOSE ${PORT:-8080}
 
-# Command to run the FastAPI app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${PORT:-8080}"]
+# Command to run FastAPI app
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
