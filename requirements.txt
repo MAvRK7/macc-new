@@ -1,18 +1,27 @@
+# Web frameworks
 fastapi==0.115.0
 uvicorn==0.30.6
 streamlit==1.39.0
 
+# Environment variables
+python-dotenv==1.0.1
+
+# CrewAI agents and tools
 crewai==0.60.0
 crewai_tools==0.8.3
 
+# LLM clients
 openai>=1.30.0
 mistralai>=1.2.0
 
-requests==2.32.3
-pygithub==2.4.0
-python-dotenv==1.0.1
+# GitHub API
+PyGithub==2.4.0
 
+# HTTP requests (backend + frontend)
+requests==2.32.3
+
+# Pydantic for models / validation
 pydantic==2.7.4
+
+# CLI helpers
 click==8.1.7
-setuptools==75.1.0
-pylint==3.3.1
