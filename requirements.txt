@@ -11,8 +11,8 @@ crewai==0.60.0
 crewai_tools==0.8.3
 
 # LLM clients
-openai>=1.30.0
-mistralai>=1.2.0
+openai==1.30.0  # Pin version for more deterministic installs
+mistralai==1.2.0  # Pin version for more deterministic installs
 
 # GitHub API
 PyGithub==2.4.0
