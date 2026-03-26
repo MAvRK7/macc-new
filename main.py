@@ -26,8 +26,7 @@ from github import Github
 
 # CrewAI / LLM imports (assumed installed)
 from crewai import Agent, Task, Crew
-# from crewai.tools import BaseTool
-from crewai.tools.base_tool import BaseTool #older version
+from crewai_tools import BaseTool
 from crewai.llms.base_llm import BaseLLM
 
 # ---------------- Logging & env ----------------
