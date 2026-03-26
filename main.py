@@ -205,16 +205,22 @@ class MultiLLM(BaseLLM):
         response = openrouter.chat.completions.create(
             model=self.primary,
             messages=messages,
+            temperature=0.2,
         )
-        return str(response.choices[0].message.content)
+        return response.choices[0].message.content.strip()
 
-    # -------- Mistral fallback --------
+    # -------- Mistral fallback --------   
     def _call_mistral(self, messages):
-        res = mistral.chat(
-            model="mistral-small-latest",
-            messages=messages,
-        )
-        return str(res.choices[0].message.content)
+        try:
+            res = mistral.chat.complete(
+                model="mistral-small-latest",
+                messages=messages,
+                temperature=0.2,
+            )
+            return res.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"❌ Mistral call failed: {e}")
+            return "Error: Mistral call failed"
 
     # -------- Core logic --------
     def _call_with_fallback(self, messages):
@@ -239,12 +245,11 @@ class MultiLLM(BaseLLM):
         messages = json.loads(messages_json)
         return self._call_with_fallback(messages)
 
-    # -------- REQUIRED method --------
+    # -------- REQUIRED method --------  
     def call(self, messages, **kwargs):
         messages = self._normalize(messages)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._cached_call, json.dumps(messages))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(self._cached_call, json.dumps(messages))
             try:
                 return future.result(timeout=self.timeout)
             except concurrent.futures.TimeoutError:
@@ -252,40 +257,38 @@ class MultiLLM(BaseLLM):
 
 llm = MultiLLM(primary="stepfun/step-3.5-flash:free")
 
-def chat_with_fallback(messages, model_primary="mistralai/mistral-small:free"):
-    # Retry OpenRouter twice
-    for attempt in range(2):
-        try:
-            response = openrouter.chat.completions.create(
-                model=model_primary,
-                messages=messages,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"⚠️ OpenRouter attempt {attempt+1} failed:", e)
-            time.sleep(0.5)
+planner = Agent(
+    role="Planner",
+    goal="Break down project spec into tasks",
+    backstory="You are an expert project planner.",
+    llm=llm
+)
+coder = Agent(
+    role="Coder",
+    goal="Generate high-quality Python code",
+    backstory="You are a senior Python developer.",
+    llm=llm,
+    tools=[code_exec_tool]
+)
+reviewer = Agent(
+    role="Reviewer",
+    goal="Review and improve code",
+    backstory="You are a strict code reviewer.",
+    llm=llm,
+    tools=[code_exec_tool]
+)
 
-    print("⚠️ Falling back to Mistral...")
-
-    try:
-        res = mistral.chat(
-        model="mistral-small-latest",
-        messages=messages,
-    )
-        return res.choices[0].message.content
-
-    except Exception as e2:
-        print("❌ Mistral fallback also failed:", e2)
-        return "Error: All LLM providers failed."
-
-planner = Agent(role="Planner", goal="Break down project spec into tasks", backstory="Planner", llm=llm)
-coder = Agent(role="Coder", goal="Generate high-quality Python code", backstory="Coder", llm=llm, tools=[code_exec_tool])
-reviewer = Agent(role="Reviewer", goal="Review and improve code", backstory="Reviewer", llm=llm, tools=[code_exec_tool])
 
 # Crew kickoff wrapper (blocking) for executor
 def run_crew(agents, tasks):
-    crew = Crew(agents=agents, tasks=tasks)
+    crew = Crew(agents=agents, tasks=tasks, verbose=True)  
     return crew.kickoff()
+
+# Helper to safely extract output
+def safe_extract_output(crew_result, fallback=""):
+    if hasattr(crew_result, "raw") and crew_result.raw:
+        return str(crew_result.raw).strip()
+    return str(crew_result).strip() or fallback
 
 # ---------------- Background tasks ----------------
 async def generate_background(session_id: str, spec: str, github_repo: Optional[str]):
@@ -310,7 +313,11 @@ async def generate_background(session_id: str, spec: str, github_repo: Optional[
 
         # PLANNER (run in thread)
         enqueue_message(session_id, "status", "Planner: breaking down tasks...")
-        plan_task = Task(description=f"Break down: {spec}", agent=planner, expected_output="tasks")
+        plan_task = Task(
+            description=f"Break down this project specification into a clear numbered list of tasks:\n{spec}\nOutput ONLY the numbered list, no extra text.",
+            agent=planner,
+            expected_output="Numbered list of tasks"
+        )   
         loop = asyncio.get_event_loop()
         try:
             plan_res = await loop.run_in_executor(executor, partial(run_crew, [planner], [plan_task]))
@@ -322,23 +329,22 @@ async def generate_background(session_id: str, spec: str, github_repo: Optional[
 
         # CODER (run in thread)
         enqueue_message(session_id, "status", "Coder: generating code...")
-        code_task = Task(description=f"Generate production-quality Python code: {spec}", agent=coder, expected_output="python_code")
-        try:
-            code_res = await loop.run_in_executor(executor, partial(run_crew, [coder], [code_task]))
-            generated = getattr(code_res, "raw", "") or ""
-        except Exception as e:
-            enqueue_message(session_id, "status", f"Coder failed: {e}")
-            generated = ""
+        code_task = Task(
+            description=f"Write a complete, production-ready, SINGLE-FILE Python script for:\n{spec}\n"
+                "Rules:\n"
+                "- All code in one file\n"
+                "- Proper imports at top\n"
+                "- Full error handling\n"
+                "- Include if __name__ == '__main__':\n"
+                "- Output ONLY the full Python code. No explanations, no markdown fences.",
+            agent=coder,
+            expected_output="Full Python code"
+        )
+        code_res = await loop.run_in_executor(executor, partial(run_crew, [coder], [code_task]))
+        generated = safe_extract_output(code_res)
 
-        if not generated.strip():
-            # fallback placeholder
-            generated = (
-                "# Placeholder Python code — coder produced empty output\n"
-                "def main():\n"
-                "    print('Hello from MACC placeholder')\n\n"
-                "if __name__ == '__main__':\n"
-                "    main()\n"
-            )
+        if not generated or len(generated) < 50:   # safety
+            generated = "# Placeholder — LLM returned empty. Try again."
             enqueue_message(session_id, "status", "Coder returned empty output; using placeholder.")
 
         # stream code lines as messages
@@ -348,18 +354,28 @@ async def generate_background(session_id: str, spec: str, github_repo: Optional[
 
         # REVIEWER (run in thread)
         enqueue_message(session_id, "status", "Reviewer: reviewing code...")
-        review_task = Task(description=f"Review and improve the code:\n{generated}", agent=reviewer, expected_output="refined_code")
-        try:
-            review_res = await loop.run_in_executor(executor, partial(run_crew, [reviewer], [review_task]))
-            refined = getattr(review_res, "raw", "") or generated
-        except Exception as e:
-            enqueue_message(session_id, "status", f"Reviewer failed: {e}")
-            refined = generated
+        review_task = Task(
+            description=f"Review and improve this code:\n\n{generated}\n\n"
+                        "Fix bugs, improve structure, add better error handling if needed. "
+                        "Output ONLY the full improved Python code. No explanations.",
+            agent=reviewer,
+            expected_output="Full improved Python code"
+        )
+
+        review_res = await loop.run_in_executor(executor, partial(run_crew, [reviewer], [review_task]))
+        refined = safe_extract_output(review_res, fallback=generated)
+
+        if not refined or len(refined) < 50:
+            refined = generated  # fallback to coder output
+            enqueue_message(session_id, "status", "Reviewer returned weak output; keeping coder version.")
 
         # stream refined code lines
         enqueue_message(session_id, "status", "Reviewer completed review; streaming refined code...")
         for ln in refined.splitlines():
             enqueue_message(session_id, "code", ln)
+
+        if refined == generated:
+            enqueue_message(session_id, "status", "Reviewer made no changes.")
 
         # generate short README (deterministic)
         readme = f"# {repo}\n\n{spec}\n\nGenerated by MACC - Multi-Agent Code Collaborator\n"
@@ -390,14 +406,20 @@ async def refine_background(session_id: str, suggestion: str):
         ctx = project_context[session_id]
         current_code = ctx.get("code", "")
         enqueue_message(session_id, "status", f"Applying suggestion: {suggestion}")
-        review_task = Task(description=f"Refine code based on: {suggestion}\n\nCurrent code:\n{current_code}", agent=reviewer, expected_output="refined_code")
+        review_task = Task(
+            description=f"Refine the following code based on the user suggestion.\n\n"
+                        f"Suggestion: {suggestion}\n\n"
+                        f"Current code:\n{current_code}\n\n"
+                        "Output ONLY the full refined Python code. No explanations, no markdown.",
+            agent=reviewer,
+            expected_output="Full refined Python code"
+        )
         loop = asyncio.get_event_loop()
-        try:
-            review_res = await loop.run_in_executor(executor, partial(run_crew, [reviewer], [review_task]))
-            refined = getattr(review_res, "raw", "") or current_code
-        except Exception as e:
-            enqueue_message(session_id, "status", f"Refinement failed: {e}")
+        review_res = await loop.run_in_executor(executor, partial(run_crew, [reviewer], [review_task]))
+        refined = safe_extract_output(review_res, fallback=current_code)
+        if not refined or len(refined) < 50:
             refined = current_code
+            enqueue_message(session_id, "status", "Refinement returned weak output; keeping previous version.")
 
         ctx["code"] = refined
         # stream refined code
