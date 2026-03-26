@@ -12,7 +12,7 @@ crewai_tools==0.8.3
 
 # LLM clients
 openai==1.30.0
-mistralai==1.2.0
+mistralai>=1.2.0,<2.0.0
 
 # GitHub API
 PyGithub==2.4.0
