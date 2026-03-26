@@ -27,3 +27,4 @@ pydantic==2.9.0  # Updated to match the required range
 click==8.1.7
 
 setuptools<82.0.0
+wheel
