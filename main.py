@@ -12,10 +12,10 @@ import concurrent.futures
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TypedDict
+from crewai import Crew, Task
 from openai import OpenAI
-# from mistralai.client import Mistral V2
-from mistralai import Mistral #V1 Older Version
+from mistralai.client import Mistral
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -24,10 +24,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from github import Github
 
-# CrewAI / LLM imports (assumed installed)
-from crewai import Agent, Task, Crew
-from crewai_tools import BaseTool
-from crewai.llms.base_llm import BaseLLM
+#LangGraph
+from langgraph.graph import StateGraph, START, END
 
 # ---------------- Logging & env ----------------
 logging.basicConfig(level=logging.INFO, filename="agent_logs.txt")
@@ -114,29 +112,157 @@ def drain_messages(session_id: str) -> list:
     msgs = session_messages[session_id][:]
     session_messages[session_id] = []
     return msgs
+# ---------------- LangGraph State ----------------
+class GraphState(TypedDict):
+    spec: str
+    tasks: str
+    code: str
+    refined_code: str
 
-# ---------------- Tools (Pydantic safe) ----------------
-class GitHubTool(BaseTool):
-    name: str = "GitHubTool"
-    description: str = "Push code and README to GitHub"
+# ---------------- Multi LLM ----------------
 
-    def _run(self, *args, **kwargs):
-        raise NotImplementedError("Use push()")
+openrouter = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
 
-    def push(self, repo_name: str, code: str, filename: str = "main.py", readme: Optional[str] = None) -> str:
+class MultiLLM:
+    def __init__(self, primary="stepfun/step-3.5-flash:free", timeout=15):
+        self.primary = primary
+        self.timeout = timeout
+
+    # -------- Normalize messages --------
+    def _normalize(self, messages):
+        if isinstance(messages, str):
+            return [{"role": "user", "content": messages}]
+        return messages
+    
+    # -------- Cache --------
+    @lru_cache(maxsize=128)
+    def _cached_call(self, messages_json: str) -> str:
+        """Cached core call with fallback logic"""
+        messages = json.loads(messages_json)
+        
+        # Try OpenRouter (with retries)
+        for attempt in range(2):
+            # Try OpenRouter first
+            try:
+                response = openrouter.chat.completions.create(
+                    model=self.primary,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=4000,          # prevent overly long responses
+                )
+                content = response.choices[0].message.content
+                return content.strip() if content else ""
+            except Exception as e:
+                logging.warning(f"OpenRouter attempt {attempt+1} failed: {e}")
+                time.sleep(0.6)
+
+        # Fallback to Mistral
+        try:
+            logging.info("Falling back to Mistral...")
+            res = mistral.chat.complete(
+                model="mistral-small-latest",
+                messages=messages,
+                temperature=0.2,
+            )
+            content = res.choices[0].message.content
+            return content.strip() if content else ""
+        except Exception as e:
+            logging.error(f"Mistral fallback failed: {e}")
+            return "# Error: Both LLM providers failed. Please try again."
+    
+    # -------- REQUIRED method -------- 
+    def call(self, prompt: str) -> str:
+        """Public method - uses cache + timeout protection"""
+        messages = self._normalize(prompt)
+        messages_json = json.dumps(messages, sort_keys=True)   # make cacheable
+
+        # Run in thread with timeout to prevent hanging
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(self._cached_call, messages_json)
+            try:
+                return future.result(timeout=self.timeout)
+            except concurrent.futures.TimeoutError:
+                logging.error("LLM call timed out")
+                return "# Error: LLM call timed out. Please try again."
+            except Exception as e:
+                logging.error(f"Unexpected error in LLM call: {e}")
+                return "# Error: LLM call failed unexpectedly."
+
+llm = MultiLLM(primary="stepfun/step-3.5-flash:free")
+
+# ---------------- LangGraph Nodes ----------------
+
+def planner_node(state: GraphState) -> dict:
+    prompt = f"""Break down this project specification into a clear numbered list of tasks.
+Project: {state['spec']}
+Output ONLY the numbered list. No extra text."""
+    tasks = llm.call(prompt)
+    return {"tasks": tasks}
+
+def coder_node(state: GraphState) -> dict:
+    prompt = f"""Write a complete, production-ready, SINGLE-FILE Python script for the following project.
+
+Project Specification:
+{state['spec']}
+
+Tasks:
+{state.get('tasks', '')}
+
+Rules:
+- All code in ONE file
+- Proper imports at the top
+- Good error handling
+- Include if __name__ == '__main__': block
+- Output ONLY the full Python code. No explanations, no markdown fences."""
+    code = llm.call(prompt)
+    return {"code": code}
+
+def reviewer_node(state: GraphState) -> dict:
+    prompt = f"""Review and improve the following Python code.
+
+Current code:
+{state['code']}
+
+Improvements needed:
+- Fix any bugs
+- Improve structure and readability
+- Add better error handling where missing
+- Keep it as a single file
+
+Output ONLY the full improved Python code. No explanations."""
+    refined = llm.call(prompt)
+    return {"refined_code": refined}
+
+# Build the graph once
+def build_graph():
+    builder = StateGraph(GraphState)
+    builder.add_node("planner", planner_node)
+    builder.add_node("coder", coder_node)
+    builder.add_node("reviewer", reviewer_node)
+    
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "coder")
+    builder.add_edge("coder", "reviewer")
+    builder.add_edge("reviewer", END)
+    
+    return builder.compile()
+
+graph = build_graph()
+
+# ---------------- GitHub tool ----------------
+
+class GitHubTool:
+    def push(self, repo_name: str, code: str, filename="main.py", readme=None):
         g = Github(GITHUB_TOKEN)
         user = g.get_user()
-        # if repo_name is "username/repo" or "repo"
-        if "/" in repo_name:
-            _, short = repo_name.split("/", 1)
-            repo_short = short
-        else:
-            repo_short = repo_name
+        repo_short = repo_name.split("/")[-1] if "/" in repo_name else repo_name
+        
         try:
             repo = user.get_repo(repo_short)
         except Exception:
             repo = user.create_repo(repo_short, auto_init=True)
-        # create or update main file
+        
+        # Update or create main file
         try:
             repo.create_file(filename, "Add main code", code)
         except Exception:
@@ -145,7 +271,7 @@ class GitHubTool(BaseTool):
                 repo.update_file(filename, "Update main code", code, existing.sha)
             except Exception:
                 pass
-        # README
+        
         if readme:
             try:
                 repo.create_file("README.md", "Add README", readme)
@@ -155,141 +281,10 @@ class GitHubTool(BaseTool):
                     repo.update_file("README.md", "Update README", readme, existing.sha)
                 except Exception:
                     pass
-        return f"https://github.com/{user.login}/{repo_short}/blob/main/{filename}"
-
-class CodeExecTool(BaseTool):
-    name: str = "CodeExecTool"
-    description: str = "Execute Python code briefly"
-
-    def _run(self, code: str) -> str:
-        import subprocess, tempfile
-        try:
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".py") as f:
-                f.write(code)
-                fname = f.name
-            proc = subprocess.run(["python", fname], capture_output=True, text=True, timeout=4)
-            return proc.stdout or proc.stderr or ""
-        except Exception as e:
-            return f"Execution error: {e}"
+        
+        return f"https://github.com/{user.login}/{repo_short}"
 
 github_tool = GitHubTool()
-code_exec_tool = CodeExecTool()
-
-# ---------------- LLM & agents ----------------
-
-openrouter = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
-
-
-class MultiLLM(BaseLLM):
-    def __init__(self, primary="stepfun/step-3.5-flash:free", timeout=12):
-        super().__init__(model=primary)  # ✅ FIXED
-        self.primary = primary
-        self.timeout = timeout
-
-    # -------- Normalize messages --------
-    def _normalize(self, messages):
-        if isinstance(messages, str):
-            return [{"role": "user", "content": messages}]
-
-        for m in messages:
-            if isinstance(m.get("content"), list):
-                m["content"] = " ".join(
-                    part.get("text", "") for part in m["content"]
-                )
-        return messages
-
-    # -------- OpenRouter --------
-    def _call_openrouter(self, messages):
-        response = openrouter.chat.completions.create(
-            model=self.primary,
-            messages=messages,
-            temperature=0.2,
-        )
-        return response.choices[0].message.content.strip()
-
-    # -------- Mistral fallback --------   
-    def _call_mistral(self, messages):
-        try:
-            res = mistral.chat.complete(
-                model="mistral-small-latest",
-                messages=messages,
-                temperature=0.2,
-            )
-            return res.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"❌ Mistral call failed: {e}")
-            return "Error: Mistral call failed"
-
-    # -------- Core logic --------
-    def _call_with_fallback(self, messages):
-        for attempt in range(2):
-            try:
-                return self._call_openrouter(messages)
-            except Exception as e:
-                print(f"⚠️ OpenRouter attempt {attempt+1} failed:", e)
-                time.sleep(0.5)
-
-        try:
-            print("⚠️ Falling back to Mistral...")
-            return self._call_mistral(messages)
-        except Exception as e:
-            print("❌ Mistral fallback failed:", e)
-
-        return "Error: All LLM providers failed."
-
-    # -------- Cache --------
-    @lru_cache(maxsize=128)
-    def _cached_call(self, messages_json):
-        messages = json.loads(messages_json)
-        return self._call_with_fallback(messages)
-
-    # -------- REQUIRED method --------  
-    def call(self, messages, **kwargs):
-        messages = self._normalize(messages)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(self._cached_call, json.dumps(messages))
-            try:
-                return future.result(timeout=self.timeout)
-            except concurrent.futures.TimeoutError:
-                return "Error: LLM timeout"
-
-llm = MultiLLM(primary="stepfun/step-3.5-flash:free")
-
-planner = Agent(
-    role="Planner",
-    goal="Break down project spec into tasks",
-    backstory="You are an expert project planner.",
-    llm=llm
-)
-coder = Agent(
-    role="Coder",
-    goal="Generate high-quality Python code",
-    backstory="You are a senior Python developer.",
-    llm=llm,
-    tools=[code_exec_tool]
-)
-reviewer = Agent(
-    role="Reviewer",
-    goal="Review and improve code",
-    backstory="You are a strict code reviewer.",
-    llm=llm,
-    tools=[code_exec_tool]
-)
-
-
-# Crew kickoff wrapper (blocking) for executor
-def run_crew(agents, tasks):
-    crew = Crew(agents=agents, tasks=tasks, verbose=True)  
-    return crew.kickoff()
-
-# Helper to safely extract output
-def safe_extract_output(crew_result, fallback=""):
-    if hasattr(crew_result, "raw") and crew_result.raw:
-        return str(crew_result.raw).strip()
-    return str(crew_result).strip() or fallback
 
 # ---------------- Background tasks ----------------
 async def generate_background(session_id: str, spec: str, github_repo: Optional[str]):
@@ -314,88 +309,53 @@ async def generate_background(session_id: str, spec: str, github_repo: Optional[
 
         # PLANNER (run in thread)
         enqueue_message(session_id, "status", "Planner: breaking down tasks...")
-        plan_task = Task(
-            description=f"Break down this project specification into a clear numbered list of tasks:\n{spec}\nOutput ONLY the numbered list, no extra text.",
-            agent=planner,
-            expected_output="Numbered list of tasks"
-        )   
-        loop = asyncio.get_event_loop()
-        try:
-            plan_res = await loop.run_in_executor(executor, partial(run_crew, [planner], [plan_task]))
-            tasks_out = [t.dict() for t in getattr(plan_res, "tasks_output", [])] if getattr(plan_res, "tasks_output", None) else []
-        except Exception as e:
-            enqueue_message(session_id, "status", f"Planner failed: {e}")
-            tasks_out = []
-        enqueue_message(session_id, "status", "Planner completed.")
+        enqueue_message(session_id, "status", "Coder generating code...")
+        enqueue_message(session_id, "status", "Reviewer improving code...")
 
-        # CODER (run in thread)
-        enqueue_message(session_id, "status", "Coder: generating code...")
-        code_task = Task(
-            description=f"Write a complete, production-ready, SINGLE-FILE Python script for:\n{spec}\n"
-                "Rules:\n"
-                "- All code in one file\n"
-                "- Proper imports at top\n"
-                "- Full error handling\n"
-                "- Include if __name__ == '__main__':\n"
-                "- Output ONLY the full Python code. No explanations, no markdown fences.",
-            agent=coder,
-            expected_output="Full Python code"
-        )
-        code_res = await loop.run_in_executor(executor, partial(run_crew, [coder], [code_task]))
-        generated = safe_extract_output(code_res)
-
-        if not generated or len(generated) < 50:   # safety
-            generated = "# Placeholder — LLM returned empty. Try again."
-            enqueue_message(session_id, "status", "Coder returned empty output; using placeholder.")
-
-        # stream code lines as messages
-        for ln in generated.splitlines():
-            enqueue_message(session_id, "code", ln)
-        enqueue_message(session_id, "status", "Coder completed generation.")
-
-        # REVIEWER (run in thread)
-        enqueue_message(session_id, "status", "Reviewer: reviewing code...")
-        review_task = Task(
-            description=f"Review and improve this code:\n\n{generated}\n\n"
-                        "Fix bugs, improve structure, add better error handling if needed. "
-                        "Output ONLY the full improved Python code. No explanations.",
-            agent=reviewer,
-            expected_output="Full improved Python code"
+        result = await asyncio.get_event_loop().run_in_executor(
+            executor, lambda: graph.invoke({"spec": spec})
         )
 
-        review_res = await loop.run_in_executor(executor, partial(run_crew, [reviewer], [review_task]))
-        refined = safe_extract_output(review_res, fallback=generated)
+        tasks = result.get("tasks", "")
+        code = result.get("refined_code") or result.get("code", "")
+        
+        if not code or len(code.strip()) < 50:
+            code = "# Error: LLM returned empty output. Please try a simpler specification."
 
-        if not refined or len(refined) < 50:
-            refined = generated  # fallback to coder output
-            enqueue_message(session_id, "status", "Reviewer returned weak output; keeping coder version.")
+        # Stream the final code
+        for line in code.splitlines():
+            enqueue_message(session_id, "code", line)
 
-        # stream refined code lines
-        enqueue_message(session_id, "status", "Reviewer completed review; streaming refined code...")
-        for ln in refined.splitlines():
-            enqueue_message(session_id, "code", ln)
+        # Create README
+        readme = f"""# {repo}
+## Description
+{spec}
 
-        if refined == generated:
-            enqueue_message(session_id, "status", "Reviewer made no changes.")
+## Generated Tasks
+{tasks}
 
-        # generate short README (deterministic)
-        readme = f"# {repo}\n\n{spec}\n\nGenerated by MACC - Multi-Agent Code Collaborator\n"
-        # store context
+Generated by MACC (LangGraph)
+```bash
+# To run:
+python main.py
+```"""
         project_context[session_id] = {
             "spec": spec,
             "github_repo": repo,
-            "tasks": tasks_out,
-            "code": refined,
+            "tasks": tasks,
+            "code": code,
             "readme": readme,
             "repo_url": None,
         }
 
-        enqueue_message(session_id, "status", f"Project ready. Repo to use: {repo}")
+        enqueue_message(session_id, "status", f"Project ready! Repo: {repo}")
         session_done[session_id] = True
+
     except Exception as e:
         logging.exception("generate_background error")
-        enqueue_message(session_id, "status", f"Unhandled error: {e}")
+        enqueue_message(session_id, "status", f"Error: {str(e)}")
         session_done[session_id] = True
+
 
 async def refine_background(session_id: str, suggestion: str):
     ensure_session(session_id)
@@ -407,22 +367,20 @@ async def refine_background(session_id: str, suggestion: str):
         ctx = project_context[session_id]
         current_code = ctx.get("code", "")
         enqueue_message(session_id, "status", f"Applying suggestion: {suggestion}")
-        review_task = Task(
-            description=f"Refine the following code based on the user suggestion.\n\n"
-                        f"Suggestion: {suggestion}\n\n"
-                        f"Current code:\n{current_code}\n\n"
-                        "Output ONLY the full refined Python code. No explanations, no markdown.",
-            agent=reviewer,
-            expected_output="Full refined Python code"
-        )
-        loop = asyncio.get_event_loop()
-        review_res = await loop.run_in_executor(executor, partial(run_crew, [reviewer], [review_task]))
-        refined = safe_extract_output(review_res, fallback=current_code)
-        if not refined or len(refined) < 50:
-            refined = current_code
-            enqueue_message(session_id, "status", "Refinement returned weak output; keeping previous version.")
+        prompt = f"""Refine the following code based on the user suggestion.
+Suggestion: {suggestion}
+Current Code:
+{current_code}
 
-        ctx["code"] = refined
+Output ONLY the full refined Python code. No explanations, no markdown."""
+        refined = llm.call(prompt)
+        
+        if not refined or len(refined.strip()) < 50:
+            refined = current_code
+            enqueue_message(session_id, "status", "LLM returned empty refinement, keeping original code.")
+        else:
+            ctx["code"]=refined #update
+
         # stream refined code
         for ln in refined.splitlines():
             enqueue_message(session_id, "code", ln)
@@ -433,6 +391,7 @@ async def refine_background(session_id: str, suggestion: str):
         enqueue_message(session_id, "status", f"Unhandled error: {e}")
         session_done[session_id] = True
 
+        
 # ---------------- API endpoints ----------------
 
 @app.post("/generate-project")
