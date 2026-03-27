@@ -12,7 +12,7 @@ langgraph>=0.2.0
 
 # LLM clients
 openai==1.30.0
-mistralai>=1.2.0,<2.0.0
+mistralai==1.5.0
 
 # GitHub API
 PyGithub==2.4.0
