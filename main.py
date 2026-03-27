@@ -67,7 +67,7 @@ project_context: Dict[str, Dict[str, Any]] = {}
 session_done: Dict[str, bool] = {}
 
 # executor for blocking Crew calls
-executor = ThreadPoolExecutor(max_workers=3)
+executor = ThreadPoolExecutor(max_workers=4)
 
 # ---------------- Models ----------------
 class ProjectRequest(BaseModel):
@@ -121,18 +121,25 @@ class GraphState(TypedDict):
 
 # ---------------- Multi LLM ----------------
 
-openrouter = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+openrouter = OpenAI(
+    base_url="https://openrouter.ai/api/v1", 
+    api_key=OPENROUTER_API_KEY,
+    default_headers={
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "MACC",
+    },
+)
 
 class MultiLLM:
-    def __init__(self, primary="stepfun/step-3.5-flash:free", timeout=15):
-        self.primary = primary
+    def __init__(self, fallback_model="qwen/qwen3-coder:free", timeout=20):
+        self.fallback_model = fallback_model
         self.timeout = timeout
 
     # -------- Normalize messages --------
-    def _normalize(self, messages):
-        if isinstance(messages, str):
-            return [{"role": "user", "content": messages}]
-        return messages
+    def _normalize(self, prompt:str):
+        if isinstance(prompt, str):
+            return [{"role": "user", "content": prompt}]
+        return prompt
     
     # -------- Cache --------
     @lru_cache(maxsize=128)
@@ -140,34 +147,39 @@ class MultiLLM:
         """Cached core call with fallback logic"""
         messages = json.loads(messages_json)
         
-        # Try OpenRouter (with retries)
-        for attempt in range(2):
-            # Try OpenRouter first
+        # ---------------- PRIMARY: Mistral ----------------
+        for attempt in range(3):
             try:
-                response = openrouter.chat.completions.create(
-                    model=self.primary,
+                res = mistral.chat.complete(
+                    model="mistral-small-latest",
+                    messages=messages,
+                    temperature=0.2,
+                )
+                content = res.choices[0].message.content
+                if content and content.strip():
+                    logging.info("Used Mistral (primary)")
+                    return content.strip()
+                else:
+                    logging.warning(f"Empty response from Mistral on attempt {attempt+1}")
+            except Exception as e:
+                logging.error(f"Mistral failed: {e}")
+                time.sleep(0.8)
+
+        # ---------------- FALLBACK: OpenRouter ----------------
+        try:
+            logging.info("Falling back to OpenRouter...")
+            response = openrouter.chat.completions.create(
+                    model=self.fallback_model,
                     messages=messages,
                     temperature=0.2,
                     max_tokens=4000,          # prevent overly long responses
-                )
-                content = response.choices[0].message.content
-                return content.strip() if content else ""
-            except Exception as e:
-                logging.warning(f"OpenRouter attempt {attempt+1} failed: {e}")
-                time.sleep(0.6)
-
-        # Fallback to Mistral
-        try:
-            logging.info("Falling back to Mistral...")
-            res = mistral.chat.complete(
-                model="mistral-small-latest",
-                messages=messages,
-                temperature=0.2,
             )
-            content = res.choices[0].message.content
-            return content.strip() if content else ""
+            content = response.choices[0].message.content
+            if content and content.strip():   # basic quality check
+                logging.info("Used OpenRouter (fallback)")
+                return content.strip()  
         except Exception as e:
-            logging.error(f"Mistral fallback failed: {e}")
+            logging.error(f"OpenRouter fallback failed: {e}")
             return "# Error: Both LLM providers failed. Please try again."
     
     # -------- REQUIRED method -------- 
@@ -176,22 +188,23 @@ class MultiLLM:
         messages = self._normalize(prompt)
         messages_json = json.dumps(messages, sort_keys=True)   # make cacheable
 
-        # Run in thread with timeout to prevent hanging
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(self._cached_call, messages_json)
-            try:
-                return future.result(timeout=self.timeout)
-            except concurrent.futures.TimeoutError:
-                logging.error("LLM call timed out")
-                return "# Error: LLM call timed out. Please try again."
-            except Exception as e:
-                logging.error(f"Unexpected error in LLM call: {e}")
-                return "# Error: LLM call failed unexpectedly."
+        future = executor.submit(self._cached_call, messages_json)
 
-llm = MultiLLM(primary="stepfun/step-3.5-flash:free")
+        # Run in thread with timeout to prevent hanging
+
+        try:
+            return future.result(timeout=self.timeout)
+        except concurrent.futures.TimeoutError:
+            logging.error("LLM call timed out")
+            return "# Error: LLM call timed out. Please try again."
+        except Exception as e:
+            logging.error(f"Unexpected error in LLM call: {e}")
+            return "# Error: LLM call failed unexpectedly."
+
+llm = MultiLLM(fallback_model="qwen/qwen3-coder:free")
 
 # ---------------- LangGraph Nodes ----------------
-
+#---PLANNER NODE---
 def planner_node(state: GraphState) -> dict:
     prompt = f"""Break down this project specification into a clear numbered list of tasks.
 Project: {state['spec']}
@@ -199,6 +212,7 @@ Output ONLY the numbered list. No extra text."""
     tasks = llm.call(prompt)
     return {"tasks": tasks}
 
+#--CODER NODE--
 def coder_node(state: GraphState) -> dict:
     prompt = f"""Write a complete, production-ready, SINGLE-FILE Python script for the following project.
 
@@ -213,10 +227,12 @@ Rules:
 - Proper imports at the top
 - Good error handling
 - Include if __name__ == '__main__': block
-- Output ONLY the full Python code. No explanations, no markdown fences."""
+- Output ONLY the full Python code. No explanations, no markdown fences.
+- If the spec is too complex, write a simplified version that captures the core idea."""
     code = llm.call(prompt)
     return {"code": code}
 
+#--REVIEWER NODE--
 def reviewer_node(state: GraphState) -> dict:
     prompt = f"""Review and improve the following Python code.
 
@@ -312,8 +328,11 @@ async def generate_background(session_id: str, spec: str, github_repo: Optional[
         enqueue_message(session_id, "status", "Coder generating code...")
         enqueue_message(session_id, "status", "Reviewer improving code...")
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            executor, lambda: graph.invoke({"spec": spec})
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                executor, lambda: graph.invoke({"spec": spec})
+            ),
+            timeout=90
         )
 
         tasks = result.get("tasks", "")
