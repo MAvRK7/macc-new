@@ -13,7 +13,6 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Dict, Any, Optional, TypedDict
-from crewai import Crew, Task
 from openai import OpenAI
 from mistralai.client import Mistral
 
