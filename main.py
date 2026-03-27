@@ -14,7 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Dict, Any, Optional, TypedDict
 from openai import OpenAI
-from mistralai.client import Mistral
+# from mistralai.client import Mistral
+from mistralai import Mistral
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
