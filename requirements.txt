@@ -6,10 +6,9 @@ streamlit==1.39.0
 # Environment variables
 python-dotenv==1.0.1
 
-# CrewAI agents and tools
-# crewai[tools]==0.60.0
-crewai==0.60.0
-crewai_tools==0.8.3
+#LangGraph
+langgraph>=0.2.0
+langgraph>=0.2.0
 
 # LLM clients
 openai==1.30.0
