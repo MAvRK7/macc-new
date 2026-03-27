@@ -8,7 +8,6 @@ python-dotenv==1.0.1
 
 #LangGraph
 langgraph>=0.2.0
-langgraph>=0.2.0
 
 # LLM clients
 openai==1.58.0
